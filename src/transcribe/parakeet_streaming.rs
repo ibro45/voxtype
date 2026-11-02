@@ -22,9 +22,8 @@
 //! pipeline (that lives in the multitalker / EOU model). Until we add VAD-
 //! based segmentation, this implementation:
 //!
-//! - emits one [`StreamingEvent::Partial`] per audio chunk with the
-//!   *cumulative* transcript so far;
-//! - emits exactly one [`StreamingEvent::Final`] with the flushed text on
+//! - emits [`StreamingEvent::Partial`] with newly decoded text deltas;
+//! - emits exactly one [`StreamingEvent::Final`] with the flushed tail delta on
 //!   stream close (samples sender dropped or cancel signal);
 //! - emits exactly one [`StreamingEvent::Ended`] last.
 //!
@@ -211,6 +210,7 @@ impl StreamingTranscriber for ParakeetStreamingTranscriber {
 
         let task = tokio::task::spawn_blocking(move || -> Result<(), TranscribeError> {
             let mut last_text = String::new();
+            let mut has_emitted_text = false;
             let segment_id: u64 = 0;
             let runtime = tokio::runtime::Handle::current();
 
@@ -251,6 +251,7 @@ impl StreamingTranscriber for ParakeetStreamingTranscriber {
                 };
 
                 if text != last_text {
+                    has_emitted_text |= !text.is_empty();
                     last_text = text.clone();
                     let _ = runtime
                         .block_on(events_tx.send(StreamingEvent::Partial { text, segment_id }));
@@ -259,14 +260,14 @@ impl StreamingTranscriber for ParakeetStreamingTranscriber {
 
             // Drain any buffered audio with flush() on close.
             let final_text = match unified.flush() {
-                Ok(t) => t.trim().to_string(),
+                Ok(t) => t,
                 Err(e) => {
                     tracing::warn!("ParakeetUnified::flush failed: {}", e);
                     last_text.trim().to_string()
                 }
             };
 
-            if !final_text.is_empty() {
+            if let Some(final_text) = non_blank_delta(final_text, has_emitted_text) {
                 let _ = runtime.block_on(events_tx.send(StreamingEvent::Final {
                     text: final_text,
                     segment_id,
@@ -296,9 +297,58 @@ impl StreamingTranscriber for ParakeetStreamingTranscriber {
     }
 }
 
+fn non_blank_delta(text: String, has_emitted_text: bool) -> Option<String> {
+    // The leading space can separate this tail from a word already emitted.
+    // Retain the old cleanup for a final-only utterance and trailing delimiters.
+    let text = if has_emitted_text {
+        text.trim_end()
+    } else {
+        text.trim()
+    };
+    if text.trim().is_empty() {
+        None
+    } else {
+        Some(text.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn final_delta_preserves_a_word_boundary_space() {
+        let tail = non_blank_delta(" do for your country.".into(), true).unwrap();
+        assert_eq!(
+            format!("what you can{tail}"),
+            "what you can do for your country."
+        );
+    }
+
+    #[test]
+    fn final_delta_does_not_insert_a_space_into_a_continuation() {
+        let tail = non_blank_delta("cause".into(), true).unwrap();
+        assert_eq!(format!("be{tail}"), "because");
+    }
+
+    #[test]
+    fn final_delta_preserves_repeated_words_but_strips_trailing_delimiters() {
+        assert_eq!(
+            non_blank_delta(" that that \n".into(), true).unwrap(),
+            " that that"
+        );
+    }
+
+    #[test]
+    fn final_only_utterance_does_not_gain_leading_whitespace() {
+        assert_eq!(non_blank_delta(" hello ".into(), false).unwrap(), "hello");
+    }
+
+    #[test]
+    fn final_delta_ignores_empty_and_whitespace_only_results() {
+        assert!(non_blank_delta(String::new(), true).is_none());
+        assert!(non_blank_delta(" \t\n".into(), true).is_none());
+    }
 
     /// Smoke test that the type and trait signatures compile. Real model-
     /// driven tests require ONNX runtime + a downloaded model and live in

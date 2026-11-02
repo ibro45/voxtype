@@ -326,10 +326,21 @@ impl StreamingSession {
             return Ok(());
         }
 
-        let processed;
+        let mut processed;
         let text = match text_processing {
             Some((tp, vocabulary)) => {
                 processed = tp.process_with_vocabulary(text, vocabulary);
+                // Filler cleanup trims an utterance, but this may be a tail
+                // whose leading spaces separate it from text already typed.
+                // Preserve those separators without guessing subword boundaries
+                // or restoring line delimiters removed by processing.
+                if self.typed_chars > 0
+                    && !processed.is_empty()
+                    && !processed.starts_with(char::is_whitespace)
+                {
+                    let leading_spaces = text.len() - text.trim_start_matches(' ').len();
+                    processed.insert_str(0, &text[..leading_spaces]);
+                }
                 processed.as_str()
             }
             None => text,
@@ -670,6 +681,54 @@ mod tests {
             }
         }
         vec![Box::new(Wrap(out))]
+    }
+
+    #[tokio::test]
+    async fn final_tail_keeps_boundary_space_through_default_text_processing() {
+        let rec = std::sync::Arc::new(RecordingOutput::new());
+        let chain = chain_with(rec.clone());
+        let mut session = StreamingSession::new();
+        let tp = TextProcessor::new(&crate::config::TextConfig::default());
+        session
+            .type_partial_delta(&chain, "what you can".into(), None, None)
+            .await
+            .unwrap();
+        session
+            .commit_segment(
+                &chain,
+                " do for your country.",
+                Some((&tp, None)),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(rec.typed(), vec!["what you can", " do for your country."]);
+        assert_eq!(
+            session.finalized_text(),
+            "what you can do for your country."
+        );
+        assert_eq!(
+            session.typed_chars(),
+            session.finalized_text().chars().count()
+        );
+    }
+
+    #[tokio::test]
+    async fn final_tail_continuation_does_not_gain_a_separator() {
+        let rec = std::sync::Arc::new(RecordingOutput::new());
+        let chain = chain_with(rec.clone());
+        let mut session = StreamingSession::new();
+        let tp = TextProcessor::new(&crate::config::TextConfig::default());
+        session
+            .type_partial_delta(&chain, "be".into(), None, None)
+            .await
+            .unwrap();
+        session
+            .commit_segment(&chain, "cause", Some((&tp, None)), None, None)
+            .await
+            .unwrap();
+        assert_eq!(rec.typed().concat(), "because");
     }
 
     #[tokio::test]
