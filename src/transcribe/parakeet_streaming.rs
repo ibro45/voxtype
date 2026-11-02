@@ -209,7 +209,6 @@ impl StreamingTranscriber for ParakeetStreamingTranscriber {
         let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
 
         let task = tokio::task::spawn_blocking(move || -> Result<(), TranscribeError> {
-            let mut last_text = String::new();
             let mut has_emitted_text = false;
             let segment_id: u64 = 0;
             let runtime = tokio::runtime::Handle::current();
@@ -250,11 +249,11 @@ impl StreamingTranscriber for ParakeetStreamingTranscriber {
                     }
                 };
 
-                if text != last_text {
-                    has_emitted_text |= !text.is_empty();
-                    last_text = text.clone();
-                    let _ = runtime
-                        .block_on(events_tx.send(StreamingEvent::Partial { text, segment_id }));
+                if let Some(event) = delta_event(text, segment_id) {
+                    has_emitted_text = true;
+                    if runtime.block_on(events_tx.send(event)).is_err() {
+                        return Ok(());
+                    }
                 }
             }
 
@@ -263,7 +262,11 @@ impl StreamingTranscriber for ParakeetStreamingTranscriber {
                 Ok(t) => t,
                 Err(e) => {
                     tracing::warn!("ParakeetUnified::flush failed: {}", e);
-                    last_text.trim().to_string()
+                    let _ = runtime.block_on(events_tx.send(StreamingEvent::Error(
+                        TranscribeError::InferenceFailed(format!("Parakeet flush failed: {e}")),
+                    )));
+                    let _ = runtime.block_on(events_tx.send(StreamingEvent::Ended));
+                    return Ok(());
                 }
             };
 
@@ -297,6 +300,10 @@ impl StreamingTranscriber for ParakeetStreamingTranscriber {
     }
 }
 
+fn delta_event(text: String, segment_id: u64) -> Option<StreamingEvent> {
+    (!text.is_empty()).then_some(StreamingEvent::Partial { text, segment_id })
+}
+
 fn non_blank_delta(text: String, has_emitted_text: bool) -> Option<String> {
     // The leading space can separate this tail from a word already emitted.
     // Retain the old cleanup for a final-only utterance and trailing delimiters.
@@ -315,6 +322,17 @@ fn non_blank_delta(text: String, has_emitted_text: bool) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn identical_nonempty_deltas_are_both_delivered() {
+        let mut text = String::new();
+        for delta in [" that", " that", "", " works"] {
+            if let Some(StreamingEvent::Partial { text: part, .. }) = delta_event(delta.into(), 0) {
+                text.push_str(&part);
+            }
+        }
+        assert_eq!(text, " that that works");
+    }
 
     #[test]
     fn final_delta_preserves_a_word_boundary_space() {
