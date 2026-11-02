@@ -20,6 +20,15 @@ use crate::config::AudioConfig;
 use crate::error::AudioError;
 use tokio::sync::mpsc;
 
+/// Whether capture also keeps a recording beside the bounded chunk channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureRetention {
+    /// Batch/eager consumers retrieve the recording through stop/get_samples.
+    Retain,
+    /// Streaming consumers use only the chunk channel and discard stop's audio.
+    ChannelOnly,
+}
+
 /// Trait for audio capture implementations
 #[async_trait::async_trait]
 #[allow(
@@ -31,11 +40,12 @@ pub trait AudioCapture: Send + Sync {
     /// Returns a channel receiver for audio chunks (f32 samples, mono, 16kHz)
     async fn start(&mut self) -> Result<mpsc::Receiver<Vec<f32>>, AudioError>;
 
-    /// Stop capturing and return all recorded samples
+    /// Stop capturing and return all retained samples (empty in ChannelOnly mode).
     async fn stop(&mut self) -> Result<Vec<f32>, AudioError>;
 
     /// Get current samples without stopping (for continuous recording modes)
     /// This drains the internal buffer and returns samples collected since the last call.
+    /// ChannelOnly capture always returns an empty Vec.
     /// Returns an empty Vec if not yet started or already stopped.
     async fn get_samples(&mut self) -> Vec<f32>;
 }
@@ -43,4 +53,14 @@ pub trait AudioCapture: Send + Sync {
 /// Factory function to create audio capture
 pub fn create_capture(config: &AudioConfig) -> Result<Box<dyn AudioCapture>, AudioError> {
     Ok(Box::new(cpal_capture::CpalCapture::new(config)?))
+}
+
+/// Create capture with an explicit recording-retention policy.
+pub fn create_capture_with_retention(
+    config: &AudioConfig,
+    retention: CaptureRetention,
+) -> Result<Box<dyn AudioCapture>, AudioError> {
+    Ok(Box::new(cpal_capture::CpalCapture::new_with_retention(
+        config, retention,
+    )?))
 }

@@ -6,7 +6,7 @@
 //! Note: cpal::Stream is not Send, so we run the audio capture in a
 //! dedicated thread and communicate via channels.
 
-use super::AudioCapture;
+use super::{AudioCapture, CaptureRetention};
 use crate::config::AudioConfig;
 use crate::error::AudioError;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,6 +27,7 @@ enum CaptureCommand {
 
 /// Parameters for building an audio input stream
 struct StreamBuildParams {
+    retention: CaptureRetention,
     samples: Arc<Mutex<Vec<f32>>>,
     tx: mpsc::Sender<Vec<f32>>,
     source_channels: usize,
@@ -40,6 +41,7 @@ struct StreamBuildParams {
 pub struct CpalCapture {
     /// Audio configuration
     config: AudioConfig,
+    retention: CaptureRetention,
     /// Command sender to the capture thread
     cmd_tx: Option<std::sync::mpsc::Sender<CaptureCommand>>,
     /// Handle to the capture thread
@@ -49,12 +51,40 @@ pub struct CpalCapture {
 impl CpalCapture {
     /// Create a new cpal audio capture instance
     pub fn new(config: &AudioConfig) -> Result<Self, AudioError> {
+        Self::new_with_retention(config, CaptureRetention::Retain)
+    }
+
+    /// Create capture without retaining a duplicate recording when only chunks are needed.
+    pub fn new_with_retention(
+        config: &AudioConfig,
+        retention: CaptureRetention,
+    ) -> Result<Self, AudioError> {
         Ok(Self {
             config: config.clone(),
+            retention,
             cmd_tx: None,
             thread_handle: None,
         })
     }
+}
+
+fn retain_samples(retention: CaptureRetention, samples: &Mutex<Vec<f32>>, chunk: &[f32]) {
+    if retention == CaptureRetention::Retain {
+        if let Ok(mut stored) = samples.lock() {
+            stored.extend_from_slice(chunk);
+        }
+    }
+}
+
+fn publish_chunk(
+    retention: CaptureRetention,
+    samples: &Mutex<Vec<f32>>,
+    tx: &mpsc::Sender<Vec<f32>>,
+    chunk: Vec<f32>,
+) {
+    retain_samples(retention, samples, &chunk);
+    // Keep capture nonblocking when the chunk consumer is slow or gone.
+    let _ = tx.try_send(chunk);
 }
 
 /// Find an audio input device by name with flexible matching.
@@ -207,6 +237,7 @@ impl AudioCapture for CpalCapture {
         // Shared state
         let samples = Arc::new(Mutex::new(Vec::<f32>::new()));
         let samples_clone = samples.clone();
+        let retention = self.retention;
 
         // Spawn audio capture thread
         let thread_handle = thread::spawn(move || {
@@ -253,6 +284,7 @@ impl AudioCapture for CpalCapture {
 
             // Create the input stream based on sample format
             let make_params = || StreamBuildParams {
+                retention,
                 samples: samples_clone.clone(),
                 tx: chunk_tx.clone(),
                 source_channels,
@@ -325,9 +357,7 @@ impl AudioCapture for CpalCapture {
                             if let Some(r) = guard.as_mut() {
                                 let tail = r.flush();
                                 if !tail.is_empty() {
-                                    if let Ok(mut s) = samples_clone.lock() {
-                                        s.extend_from_slice(&tail);
-                                    }
+                                    retain_samples(retention, &samples_clone, &tail);
                                 }
                             }
                         }
@@ -418,6 +448,11 @@ impl AudioCapture for CpalCapture {
             let _ = handle.join();
         }
 
+        if self.retention == CaptureRetention::ChannelOnly {
+            tracing::debug!("Audio capture stopped (channel-only)");
+            return Ok(samples);
+        }
+
         let duration_secs = samples.len() as f32 / self.config.sample_rate as f32;
         tracing::debug!(
             "Audio capture stopped: {} samples ({:.2}s)",
@@ -469,6 +504,7 @@ where
     use cpal::traits::DeviceTrait;
 
     let StreamBuildParams {
+        retention,
         samples,
         tx,
         source_channels,
@@ -504,13 +540,7 @@ where
                     Err(_) => mono_f32,
                 };
 
-                // Store samples
-                if let Ok(mut guard) = samples.lock() {
-                    guard.extend_from_slice(&resampled);
-                }
-
-                // Send chunk for streaming (ignore errors - receiver might be gone)
-                let _ = tx.try_send(resampled);
+                publish_chunk(retention, &samples, &tx, resampled);
             },
             err_fn,
             None,
@@ -523,6 +553,100 @@ where
 #[cfg(test)]
 mod tests {
     use super::super::resampler::resample_buffer;
+    use super::*;
+    use crate::audio::CaptureRetention;
+
+    #[test]
+    fn capture_retains_audio_by_default() {
+        let capture = CpalCapture::new(&AudioConfig::default()).unwrap();
+        assert_eq!(capture.retention, CaptureRetention::Retain);
+    }
+
+    #[tokio::test]
+    async fn channel_only_stop_succeeds_without_a_retained_recording() {
+        let mut capture =
+            CpalCapture::new_with_retention(&AudioConfig::default(), CaptureRetention::ChannelOnly)
+                .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        capture.cmd_tx = Some(tx);
+        capture.thread_handle = Some(thread::spawn(move || {
+            while let Ok(command) = rx.recv() {
+                match command {
+                    CaptureCommand::GetSamples(response) => {
+                        let _ = response.send(Vec::new());
+                    }
+                    CaptureCommand::Stop(response) => {
+                        let _ = response.send(Vec::new());
+                        break;
+                    }
+                }
+            }
+        }));
+        assert!(capture.get_samples().await.is_empty());
+        assert!(capture.stop().await.unwrap().is_empty());
+        assert!(capture.cmd_tx.is_none());
+        assert!(capture.thread_handle.is_none());
+    }
+
+    #[tokio::test]
+    async fn retained_capture_still_rejects_an_empty_recording() {
+        let mut capture = CpalCapture::new(&AudioConfig::default()).unwrap();
+        assert!(matches!(
+            capture.stop().await,
+            Err(AudioError::EmptyRecording)
+        ));
+    }
+
+    #[test]
+    fn channel_only_capture_delivers_without_retaining_audio() {
+        let samples = Mutex::new(Vec::new());
+        let (tx, mut rx) = mpsc::channel(1);
+        // More than a minute of 16 kHz PCM, without opening a microphone.
+        for sequence in 0..10_000 {
+            let chunk = vec![sequence as f32; 160];
+            publish_chunk(CaptureRetention::ChannelOnly, &samples, &tx, chunk.clone());
+            assert_eq!(rx.try_recv().unwrap(), chunk);
+        }
+        let stored = samples.lock().unwrap();
+        assert!(stored.is_empty());
+        assert_eq!(stored.capacity(), 0);
+    }
+
+    #[test]
+    fn retained_capture_keeps_ordered_samples_and_stop_tail() {
+        let samples = Mutex::new(Vec::new());
+        let (tx, mut rx) = mpsc::channel(2);
+        publish_chunk(CaptureRetention::Retain, &samples, &tx, vec![0.1, 0.2]);
+        publish_chunk(CaptureRetention::Retain, &samples, &tx, vec![0.3]);
+        // Stop stores the existing resampler tail without publishing it.
+        retain_samples(CaptureRetention::Retain, &samples, &[0.4, 0.5]);
+        assert_eq!(*samples.lock().unwrap(), vec![0.1, 0.2, 0.3, 0.4, 0.5]);
+        assert_eq!(rx.try_recv().unwrap(), vec![0.1, 0.2]);
+        assert_eq!(rx.try_recv().unwrap(), vec![0.3]);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn channel_only_capture_does_not_retain_stop_tail() {
+        let samples = Mutex::new(Vec::new());
+        retain_samples(CaptureRetention::ChannelOnly, &samples, &[0.4, 0.5]);
+        let stored = samples.lock().unwrap();
+        assert!(stored.is_empty());
+        assert_eq!(stored.capacity(), 0);
+    }
+
+    #[test]
+    fn channel_only_capture_tolerates_full_and_closed_receiver() {
+        let samples = Mutex::new(Vec::new());
+        let (tx, mut rx) = mpsc::channel(1);
+        publish_chunk(CaptureRetention::ChannelOnly, &samples, &tx, vec![0.1]);
+        publish_chunk(CaptureRetention::ChannelOnly, &samples, &tx, vec![0.2]);
+        assert_eq!(rx.try_recv().unwrap(), vec![0.1]);
+        assert!(rx.try_recv().is_err());
+        drop(rx);
+        publish_chunk(CaptureRetention::ChannelOnly, &samples, &tx, vec![0.3]);
+        assert!(samples.lock().unwrap().is_empty());
+    }
 
     // These moved off the removed linear-interpolation `resample()` and onto
     // the band-limited path (#641). They cover very short inputs, which is a

@@ -2973,13 +2973,14 @@ impl Daemon {
         track_silence: bool,
     ) -> std::result::Result<(Box<dyn AudioCapture>, tokio::sync::mpsc::Receiver<Vec<f32>>), ()>
     {
+        let retention = audio::CaptureRetention::ChannelOnly;
         #[cfg(test)]
         let capture = match self.history_test_capture.take() {
             Some(capture) => Ok(capture),
-            None => audio::create_capture(&self.config.audio),
+            None => audio::create_capture_with_retention(&self.config.audio, retention),
         };
         #[cfg(not(test))]
-        let capture = audio::create_capture(&self.config.audio);
+        let capture = audio::create_capture_with_retention(&self.config.audio, retention);
         match capture {
             Ok(mut capture) => match capture.start().await {
                 Ok(chunk_rx) => {
