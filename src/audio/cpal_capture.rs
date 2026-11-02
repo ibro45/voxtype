@@ -9,7 +9,7 @@
 use super::{AudioCapture, CaptureRetention};
 use crate::config::AudioConfig;
 use crate::error::AudioError;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use tokio::sync::{mpsc, oneshot};
@@ -17,6 +17,12 @@ use tokio::sync::{mpsc, oneshot};
 /// How long `start()` waits for the capture thread to confirm the stream is
 /// running before returning anyway.
 const STREAM_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+static STREAM_DROPPED_SAMPLES: AtomicU64 = AtomicU64::new(0);
+
+pub fn stream_dropped_samples() -> u64 {
+    STREAM_DROPPED_SAMPLES.load(Ordering::Relaxed)
+}
 
 /// Commands sent to the audio capture thread
 enum CaptureCommand {
@@ -84,7 +90,15 @@ fn publish_chunk(
 ) {
     retain_samples(retention, samples, &chunk);
     // Keep capture nonblocking when the chunk consumer is slow or gone.
-    let _ = tx.try_send(chunk);
+    let count = chunk.len() as u64;
+    if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(chunk) {
+        if retention == CaptureRetention::ChannelOnly {
+            let previous = STREAM_DROPPED_SAMPLES.fetch_add(count, Ordering::Relaxed);
+            if previous == 0 {
+                tracing::error!("Streaming capture queue overflow: audio was lost");
+            }
+        }
+    }
 }
 
 /// Find an audio input device by name with flexible matching.
@@ -358,6 +372,14 @@ impl AudioCapture for CpalCapture {
                                 let tail = r.flush();
                                 if !tail.is_empty() {
                                     retain_samples(retention, &samples_clone, &tail);
+                                    if retention == CaptureRetention::ChannelOnly {
+                                        publish_chunk(
+                                            CaptureRetention::ChannelOnly,
+                                            &samples_clone,
+                                            &chunk_tx,
+                                            tail,
+                                        );
+                                    }
                                 }
                             }
                         }

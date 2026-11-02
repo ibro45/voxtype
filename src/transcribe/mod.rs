@@ -23,6 +23,7 @@ pub mod parakeet_streaming;
 pub mod remote;
 pub mod sliding_window;
 pub mod soniox;
+pub mod speech_gate;
 pub mod streaming;
 pub mod subprocess;
 pub mod whisper;

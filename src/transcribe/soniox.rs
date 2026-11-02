@@ -1583,6 +1583,7 @@ mod tests {
                 } => ("Replace", format!("-{}+{}", backspace, text)),
                 StreamingEvent::Ended => ("Ended", String::new()),
                 StreamingEvent::Error(e) => ("Error", e.to_string()),
+                StreamingEvent::SegmentEnded => ("SegmentEnded", String::new()),
             })
             .collect()
     }

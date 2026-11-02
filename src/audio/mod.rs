@@ -14,6 +14,7 @@ pub mod levels;
 pub mod media;
 pub mod resampler;
 
+pub use cpal_capture::stream_dropped_samples;
 pub use dual_capture::{AudioSourceType, DualCapture, DualSamples, SourcedSample};
 
 use crate::config::AudioConfig;

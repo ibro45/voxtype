@@ -189,6 +189,7 @@ async fn real_stream_fidelity(name: &str, partials: bool) {
                 if !stopped { daemon.stop_active_recording(&mut state, &mut capture, &mut session, &mut chain, &mut None).await; stopped = true; }
             }
             StreamingEvent::Replace { backspace, text, .. } => { observed.push(serde_json::json!({"backspace":backspace,"replacement":text})); session.as_mut().unwrap().replace_and_commit_silent(backspace, &text); }
+            StreamingEvent::SegmentEnded => panic!("Only a gated stream ends segments"),
             StreamingEvent::Ended => break,
             StreamingEvent::Error(error) => panic!("Actual streaming backend error: {error}"),
         }

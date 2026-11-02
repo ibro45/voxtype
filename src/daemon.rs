@@ -2276,8 +2276,25 @@ impl Daemon {
             Err(()) => return false,
         };
 
-        let streaming = transcriber.as_streaming().expect("checked above");
-        let handle = match streaming.start_stream(samples_rx) {
+        let output_override = read_output_mode_override();
+        let file_output_path = self.resolve_file_output_path(&output_override, None);
+        let result = if self.config.speech_gate.enabled {
+            crate::transcribe::speech_gate::start_gated_stream(
+                transcriber.clone(),
+                samples_rx,
+                self.config.speech_gate.clone(),
+                // Hold mode decodes each accepted speech segment offline: no
+                // overlapping streaming windows, and text is typed after release.
+                file_output_path.is_some()
+                    && self.config.engine == crate::config::TranscriptionEngine::Parakeet,
+            )
+        } else {
+            transcriber
+                .as_streaming()
+                .expect("checked above")
+                .start_stream(samples_rx)
+        };
+        let handle = match result {
             Ok(h) => h,
             Err(e) => {
                 tracing::error!("Failed to start streaming session: {}", e);
@@ -2285,6 +2302,19 @@ impl Daemon {
                 // Drop the capture cleanly; ignore final samples.
                 let mut c = capture;
                 let _ = c.stop().await;
+                if self.config.speech_gate.enabled {
+                    send_notification(
+                        "Speech gate could not start",
+                        &e.to_string(),
+                        self.config.output.notification.show_engine_icon,
+                        self.config.engine,
+                        "critical",
+                    )
+                    .await;
+                    // Handled failure: never silently fall back to ungated ASR
+                    // when the user explicitly requested a speech gate.
+                    return true;
+                }
                 return false;
             }
         };
@@ -2295,8 +2325,6 @@ impl Daemon {
         // silently use the configured default. A `--file=path` (or
         // `mode = "file"`) session accumulates into `finalized_text` instead
         // of typing, gated on `file_output_path`; its chain goes unused.
-        let output_override = read_output_mode_override();
-        let file_output_path = self.resolve_file_output_path(&output_override, None);
         let output_config = apply_output_override(&self.config.output, output_override);
 
         *audio_capture = Some(capture);
@@ -2394,26 +2422,18 @@ impl Daemon {
             // whatever the backend was still draining, and end_streaming
             // would then write an empty file. Let it drain normally so
             // end_streaming can write the real text.
-            let file_output = matches!(
-                &*state,
-                State::Streaming {
-                    file_output_path: Some(_),
-                    ..
-                }
-            );
-            if file_output {
-                tracing::info!("Stopping streaming session (file output); closing capture");
-            } else {
-                tracing::info!("Stopping streaming session; closing capture and disowning session");
-            }
+            // Graceful stop must retain the output owner until Final/Ended.
+            // Cancel uses its separate rewind/discard path.
             self.stop_streaming_capture(audio_capture).await;
-            if !file_output {
-                // Drop the typing surface synchronously so any
-                // Final/Partial events the backend emits while
-                // draining its internal buffer reach the event-pump
-                // arm with `streaming_session = None` and get
-                // discarded instead of typed into whatever window
-                // has focus by then.
+            if !self.config.speech_gate.enabled
+                && matches!(
+                    state,
+                    State::Streaming {
+                        file_output_path: None,
+                        ..
+                    }
+                )
+            {
                 *streaming_session = None;
                 *streaming_chain = None;
             }
@@ -2528,11 +2548,22 @@ impl Daemon {
     /// drain, and stop the mic. Leaves `streaming_session`/`_chain` for
     /// the caller to disown (or keep, to receive trailing finals).
     async fn stop_streaming_capture(&mut self, audio_capture: &mut Option<Box<dyn AudioCapture>>) {
-        self.cut_streaming_audio();
-        self.start_streaming_drain_pump();
-        if let Some(mut c) = audio_capture.take() {
-            if let Ok(samples) = c.stop().await {
-                self.history_note(|pending| pending.entry.audio_ms = samples.len() as u64 / 16);
+        if self.config.speech_gate.enabled {
+            self.update_state("transcribing");
+            if let Some(mut c) = audio_capture.take() {
+                if let Ok(samples) = c.stop().await {
+                    self.history_note(|pending| pending.entry.audio_ms = samples.len() as u64 / 16);
+                }
+            }
+            // Keep the bounded pump running. Returning to the main select loop
+            // lets text events drain concurrently, avoiding a queue cycle.
+        } else {
+            self.cut_streaming_audio();
+            self.start_streaming_drain_pump();
+            if let Some(mut c) = audio_capture.take() {
+                if let Ok(samples) = c.stop().await {
+                    self.history_note(|pending| pending.entry.audio_ms = samples.len() as u64 / 16);
+                }
             }
         }
         self.restore_recording_media();
@@ -2593,6 +2624,10 @@ impl Daemon {
             // Don't error on join failure; the task may have already
             // completed. We drop events implicitly here.
             let _ = h.task.await;
+        }
+        if let Some(pump) = self.level_emitter_task.take() {
+            pump.abort();
+            let _ = pump.await;
         }
         self.stop_streaming_drain_pump();
 
@@ -2995,12 +3030,14 @@ impl Daemon {
                     self.is_external_trigger = track_silence;
                     let speech_tracker = self.new_speech_tracker(track_silence);
                     self.silence_tracker = speech_tracker.clone();
+                    let lossless = self.config.speech_gate.enabled;
                     let handle = if let Some(hub) = &self.level_hub {
-                        audio::levels::spawn_emitter_with_streaming_tap(
+                        audio::levels::spawn_emitter_with_streaming_policy(
                             chunk_rx,
                             hub.frame_sink(),
                             Some(streaming_tx),
                             speech_tracker,
+                            lossless,
                         )
                     } else {
                         // No OSD: still need to drive chunk_rx → streaming_tx,
@@ -3017,9 +3054,12 @@ impl Daemon {
                                         tracker.observe(frame.peak_dbfs).await;
                                     }
                                 }
-                                if let Err(e) = streaming_tx.try_send(chunk) {
-                                    // Backend slow or gone; drop and keep going.
-                                    tracing::trace!("streaming sample tap try_send failed: {}", e);
+                                if lossless {
+                                    if streaming_tx.send(chunk).await.is_err() {
+                                        break;
+                                    }
+                                } else {
+                                    let _ = streaming_tx.try_send(chunk);
                                 }
                             }
                         })
@@ -7064,8 +7104,13 @@ impl Daemon {
                     // already gone so we don't re-fire cleanup on every 100ms
                     // tick while the streaming session drains server-side
                     // (state stays Streaming until Ended arrives).
+                    let unlimited_toggle = self.config.speech_gate.enabled
+                        && self.config.speech_gate.continuous_toggle
+                        && !self.is_external_trigger
+                        && matches!(self.config.hotkey.mode, crate::config::ActivationMode::Toggle)
+                        && matches!(&state, State::Streaming { file_output_path: None, .. });
                     if let (true, Some(elapsed)) =
-                        (audio_capture.is_some(), state.recording_duration())
+                        (audio_capture.is_some() && !unlimited_toggle, state.recording_duration())
                     {
                         match cap_warning_due(elapsed, max_duration) {
                             Some(left) if !cap_warned => {
@@ -7077,7 +7122,7 @@ impl Daemon {
                         }
                     }
 
-                    let timeout_fired = audio_capture.is_some()
+                    let timeout_fired = audio_capture.is_some() && !unlimited_toggle
                         && state.recording_duration().is_some_and(|d| d > max_duration);
                     if timeout_fired {
                         self.osd_limit_reached = true;
@@ -7390,6 +7435,17 @@ impl Daemon {
                                     *typed_chars = s.typed_chars();
                                     finalized_text.clear();
                                     finalized_text.push_str(s.finalized_text());
+                                }
+                            }
+                        }
+                        Some(StreamingEvent::SegmentEnded) => {
+                            if let Some(session) = streaming_session.as_mut() {
+                                session.finish_speech_segment(file_output);
+                                if let State::Streaming { typed_chars, .. } = &mut state { *typed_chars=session.typed_chars(); }
+                            }
+                            if !file_output {
+                                if let State::Streaming { finalized_text, partial_buffer, .. } = &mut state {
+                                    finalized_text.clear(); partial_buffer.clear();
                                 }
                             }
                         }

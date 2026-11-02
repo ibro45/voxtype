@@ -111,6 +111,9 @@ pub struct Config {
     #[serde(default)]
     pub vad: VadConfig,
 
+    #[serde(default)]
+    pub speech_gate: super::SpeechGateConfig,
+
     /// Status display configuration (icons for Waybar/tray integrations)
     #[serde(default)]
     pub status: StatusConfig,
@@ -221,6 +224,7 @@ impl Default for Config {
             streaming: None,
             text: TextConfig::default(),
             vad: VadConfig::default(),
+            speech_gate: super::SpeechGateConfig::default(),
             status: StatusConfig::default(),
             osd: crate::osd::config::OsdConfig::default(),
             tray: TrayConfig::default(),

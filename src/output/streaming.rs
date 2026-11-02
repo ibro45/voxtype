@@ -75,6 +75,7 @@ pub struct StreamingSession {
     history_raw_partial: String,
     output_error: Option<String>,
     last_delivery: Option<Delivered>,
+    needs_separator: bool,
 }
 
 impl StreamingSession {
@@ -89,6 +90,7 @@ impl StreamingSession {
             history_raw_partial: String::new(),
             output_error: None,
             last_delivery: None,
+            needs_separator: false,
         }
     }
 
@@ -190,6 +192,7 @@ impl StreamingSession {
         }
 
         let history_context = self.history_context.clone();
+        let new_partial = self.segment_text(&new_partial);
         let opts = OutputOptions {
             history_context: history_context.as_ref(),
             pre_output_command,
@@ -224,7 +227,33 @@ impl StreamingSession {
         if self.history_context.is_some() {
             self.history_raw_partial.push_str(new_partial);
         }
-        self.partial.push_str(new_partial);
+        let text = self.segment_text(new_partial);
+        self.partial.push_str(&text);
+    }
+
+    /// Finish an inner speech segment without ending the outer activation.
+    /// Live output commits completed speech and rewinds only the current segment.
+    pub fn finish_speech_segment(&mut self, keep_history: bool) {
+        self.needs_separator |=
+            self.typed_chars > 0 || !self.finalized_text.is_empty() || !self.partial.is_empty();
+        self.finalize_pending_partial();
+        if !keep_history {
+            self.finalized_text.clear();
+            self.typed_chars = 0;
+        }
+    }
+
+    fn segment_text(&mut self, text: &str) -> String {
+        if text.trim().is_empty() {
+            return text.to_owned();
+        }
+        let separator = self.needs_separator && !text.starts_with(char::is_whitespace);
+        self.needs_separator = false;
+        if separator {
+            format!(" {text}")
+        } else {
+            text.to_owned()
+        }
     }
 
     /// Current partial buffer.
@@ -362,6 +391,8 @@ impl StreamingSession {
         // output. Users who rely on post_process should disable
         // streaming for now.
         let history_context = self.history_context.clone();
+        let segment_text = self.segment_text(text);
+        let text = segment_text.as_str();
         let opts = OutputOptions {
             history_context: history_context.as_ref(),
             pre_output_command,
@@ -409,6 +440,7 @@ impl StreamingSession {
             self.clear_partial();
             return;
         }
+        let text = self.segment_text(text);
         let finalized_tail = format!("{}{}", self.partial, text);
         self.finalized_text.push_str(&finalized_tail);
         self.clear_partial();
@@ -627,6 +659,19 @@ async fn try_ydotool_backspaces(count: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_segments_join_once_and_live_history_can_be_released() {
+        let mut session = StreamingSession::new();
+        session.observe_partial_delta("hello");
+        session.commit_segment_silent(" world.");
+        session.finish_speech_segment(true);
+        session.commit_segment_silent("Next sentence.");
+        assert_eq!(session.finalized_text(), "hello world. Next sentence.");
+        session.finish_speech_segment(false);
+        assert!(session.finalized_text().is_empty());
+        assert!(session.partial().is_empty());
+    }
     use async_trait::async_trait;
     use std::sync::Mutex;
 
@@ -712,6 +757,27 @@ mod tests {
             session.typed_chars(),
             session.finalized_text().chars().count()
         );
+    }
+
+    #[tokio::test]
+    async fn completed_live_segments_release_history_and_limit_cancel_to_current_speech() {
+        let rec = std::sync::Arc::new(RecordingOutput::new());
+        let chain = chain_with(rec.clone());
+        let mut session = StreamingSession::new();
+        session
+            .type_partial_delta(&chain, "First.".into(), None, None)
+            .await
+            .unwrap();
+        session.finish_speech_segment(false);
+        assert_eq!(session.typed_chars(), 0);
+        assert!(session.finalized_text().is_empty());
+        session.finish_speech_segment(false); // Empty boundaries cannot lose the separator.
+        session
+            .type_partial_delta(&chain, "Second.".into(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(rec.typed().concat(), "First. Second.");
+        assert_eq!(session.typed_chars(), " Second.".chars().count());
     }
 
     #[tokio::test]

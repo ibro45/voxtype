@@ -89,6 +89,9 @@ pub enum StreamingEvent {
     /// samples sender and the backend has flushed).
     Ended,
 
+    /// Inner VAD speech segment drained; the outer activation continues.
+    SegmentEnded,
+
     /// A non-recoverable error occurred. The daemon should treat this
     /// like `Ended` for state purposes and surface the error to the user.
     Error(TranscribeError),

@@ -21,6 +21,7 @@ mod parse;
 mod profile;
 mod root;
 pub mod schema;
+mod speech_gate;
 mod status;
 mod streaming;
 pub(crate) mod text;
@@ -57,6 +58,7 @@ pub use output::{
 pub use profile::{PostProcessConfig, Profile, VocabularyConfig};
 pub(crate) use root::EngineLanguage;
 pub use root::{ActiveGguf, Config, OmarchyConfig, TextLanguageSource, TrayConfig};
+pub use speech_gate::SpeechGateConfig;
 pub use status::{ResolvedIcons, StatusConfig, StatusIconOverrides};
 pub use streaming::StreamingConfig;
 pub use text::TextConfig;

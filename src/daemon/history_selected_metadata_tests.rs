@@ -47,6 +47,7 @@ async fn selected_metadata_case(name: &str, eager: bool, fail: bool, cancel: boo
                     StreamingEvent::Partial { text, .. } => { session.as_mut().unwrap().observe_partial_delta(&text); if !stopped { daemon.stop_active_recording(&mut state, &mut capture, &mut session, &mut chain, &mut None).await; stopped = true; } }
                     StreamingEvent::Final { text, .. } => session.as_mut().unwrap().commit_segment_silent(&text),
                     StreamingEvent::Replace { .. } => panic!("Controlled fixture does not revise"),
+                    StreamingEvent::SegmentEnded => panic!("Only a gated stream ends segments"),
                     StreamingEvent::Error(error) => { assert!(fail); daemon.end_streaming_with_error(error, &mut state, &mut capture, &mut handle, &mut session, &mut chain).await; break; }
                     StreamingEvent::Ended => { daemon.end_streaming(&mut state, &mut capture, &mut handle, &mut session, &mut chain).await; break; }
                 }
@@ -173,6 +174,7 @@ async fn eof_failure_persistence(name: &str, partial: bool) {
             StreamingEvent::Error(e) => { errors+=1; daemon.end_streaming_with_error(e,&mut state,&mut capture,&mut handle,&mut session,&mut chain).await; break; }
             StreamingEvent::Ended => { daemon.end_streaming(&mut state,&mut capture,&mut handle,&mut session,&mut chain).await; break; }
             StreamingEvent::Replace {..} => panic!("fixture does not revise"),
+            StreamingEvent::SegmentEnded => panic!("Only a gated stream ends segments"),
         }
     }
     let entries=wait_for_entries(root.path(),1).await;

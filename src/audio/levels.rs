@@ -638,10 +638,20 @@ pub fn spawn_emitter(
 /// trace and never blocks the level emitter. When both optional args are
 /// `None`, behavior is identical to [`spawn_emitter`].
 pub fn spawn_emitter_with_streaming_tap(
+    chunk_rx: mpsc::Receiver<Vec<f32>>,
+    sink: FrameSink,
+    streaming_tx: Option<mpsc::Sender<Vec<f32>>>,
+    speech_tracker: Option<SpeechTracker>,
+) -> tokio::task::JoinHandle<()> {
+    spawn_emitter_with_streaming_policy(chunk_rx, sink, streaming_tx, speech_tracker, false)
+}
+
+pub fn spawn_emitter_with_streaming_policy(
     mut chunk_rx: mpsc::Receiver<Vec<f32>>,
     sink: FrameSink,
     streaming_tx: Option<mpsc::Sender<Vec<f32>>>,
     speech_tracker: Option<SpeechTracker>,
+    lossless: bool,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut bucketer = LevelBucketer::new();
@@ -660,8 +670,12 @@ pub fn spawn_emitter_with_streaming_tap(
             }
 
             if let Some(ref tx) = streaming_tx {
-                if let Err(e) = tx.try_send(chunk) {
-                    tracing::trace!("streaming sample tap try_send failed: {}", e);
+                if lossless {
+                    if tx.send(chunk).await.is_err() {
+                        break;
+                    }
+                } else {
+                    let _ = tx.try_send(chunk);
                 }
             }
         }
