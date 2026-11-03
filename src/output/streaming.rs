@@ -76,6 +76,8 @@ pub struct StreamingSession {
     output_error: Option<String>,
     last_delivery: Option<Delivered>,
     needs_separator: bool,
+    live_filter_pending: String,
+    live_filter_bypass: bool,
 }
 
 impl StreamingSession {
@@ -91,6 +93,8 @@ impl StreamingSession {
             output_error: None,
             last_delivery: None,
             needs_separator: false,
+            live_filter_pending: String::new(),
+            live_filter_bypass: false,
         }
     }
 
@@ -192,6 +196,7 @@ impl StreamingSession {
         }
 
         let history_context = self.history_context.clone();
+        let separator_before = self.needs_separator;
         let new_partial = self.segment_text(&new_partial);
         let opts = OutputOptions {
             history_context: history_context.as_ref(),
@@ -204,11 +209,114 @@ impl StreamingSession {
             modifier_release_timeout: std::time::Duration::from_millis(0),
         };
         let result = deliver_with_fallback(chain, &new_partial, opts).await;
-        self.note_delivery(result)?;
+        if let Err(e) = self.note_delivery(result) {
+            self.needs_separator = separator_before;
+            return Err(e);
+        }
 
         self.typed_chars += new_partial.chars().count();
         self.partial.push_str(&new_partial);
         Ok(())
+    }
+
+    /// Filter only complete words in a known delta stream. Keep the current
+    /// word and its separator until it completes, so subword pieces cannot
+    /// be mistaken for fillers. This adds at most one incomplete word of
+    /// lookahead; opt-out bypasses it entirely.
+    pub async fn type_partial_delta_filtered(
+        &mut self,
+        chain: &[Box<dyn TextOutput>],
+        delta: String,
+        processor: &TextProcessor,
+        pre: Option<&str>,
+        post: Option<&str>,
+    ) -> Result<(), OutputError> {
+        if !processor.filters_streaming_fillers() && self.live_filter_pending.is_empty() {
+            return self.type_partial_delta(chain, delta, pre, post).await;
+        }
+        if self.live_filter_pending.len() + delta.len() > 65536 {
+            return Err(OutputError::InjectionFailed(
+                "Live cleanup retry buffer exceeded 64KiB".into(),
+            ));
+        }
+        self.live_filter_pending.push_str(&delta);
+        if self.live_filter_bypass || self.live_filter_pending.len() > 4096 {
+            self.live_filter_bypass = true;
+            let raw = std::mem::take(&mut self.live_filter_pending);
+            if let Err(e) = self.type_partial_delta(chain, raw.clone(), pre, post).await {
+                self.live_filter_pending = raw;
+                return Err(e);
+            }
+            return Ok(());
+        }
+        let Some(boundary) = self.live_filter_pending.rfind(char::is_whitespace) else {
+            return Ok(());
+        };
+        let ready_end = self.live_filter_pending[..boundary].trim_end().len();
+        if ready_end == 0 {
+            return Ok(());
+        }
+        let original = self.live_filter_pending.clone();
+        let rest = self.live_filter_pending.split_off(ready_end);
+        let ready = std::mem::replace(&mut self.live_filter_pending, rest);
+        let cleaned = processor.clean_streaming_fillers(&ready);
+        // Keep a trailing connector untyped until the following word/final
+        // punctuation resolves it; this avoids irreversibly typing `word,.`.
+        let body_end = if cleaned.ends_with("::") {
+            cleaned.len()
+        } else {
+            cleaned.trim_end_matches([',', ';', ':']).len()
+        };
+        self.live_filter_pending.insert_str(0, &cleaned[body_end..]);
+        if let Err(e) = self
+            .type_partial_delta(chain, cleaned[..body_end].to_owned(), pre, post)
+            .await
+        {
+            self.live_filter_pending = original;
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Complete a known delta stream with filler-only processing. Both the
+    /// pending word and real Final follow the same policy as live partials.
+    pub async fn commit_live_delta(
+        &mut self,
+        chain: &[Box<dyn TextOutput>],
+        text: &str,
+        processor: &TextProcessor,
+        pre: Option<&str>,
+        post: Option<&str>,
+    ) -> Result<(), OutputError> {
+        let before = std::mem::take(&mut self.live_filter_pending);
+        let raw = format!("{before}{text}");
+        // Deferred inter-word whitespace is not an extra character at EOF.
+        let raw = raw.trim_end().to_owned();
+        let cleaned = if self.live_filter_bypass {
+            raw
+        } else {
+            processor.clean_streaming_fillers(&raw)
+        };
+        if let Err(e) = self.type_partial_delta(chain, cleaned, pre, post).await {
+            self.live_filter_pending = before;
+            return Err(e);
+        }
+        self.finalize_pending_partial();
+        Ok(())
+    }
+
+    pub async fn flush_live_filter(
+        &mut self,
+        chain: &[Box<dyn TextOutput>],
+        processor: &TextProcessor,
+        pre: Option<&str>,
+        post: Option<&str>,
+    ) -> Result<(), OutputError> {
+        if self.live_filter_pending.is_empty() {
+            return Ok(());
+        }
+        self.commit_live_delta(chain, "", processor, pre, post)
+            .await
     }
 
     /// Clear the partial buffer (e.g., when a Final supersedes it).
@@ -234,6 +342,12 @@ impl StreamingSession {
     /// Finish an inner speech segment without ending the outer activation.
     /// Live output commits completed speech and rewinds only the current segment.
     pub fn finish_speech_segment(&mut self, keep_history: bool) {
+        self.live_filter_bypass = false;
+        if !self.live_filter_pending.is_empty()
+            && !self.live_filter_pending.ends_with(char::is_whitespace)
+        {
+            self.live_filter_pending.push(' ');
+        }
         self.needs_separator |=
             self.typed_chars > 0 || !self.finalized_text.is_empty() || !self.partial.is_empty();
         self.finalize_pending_partial();
@@ -391,6 +505,7 @@ impl StreamingSession {
         // output. Users who rely on post_process should disable
         // streaming for now.
         let history_context = self.history_context.clone();
+        let separator_before = self.needs_separator;
         let segment_text = self.segment_text(text);
         let text = segment_text.as_str();
         let opts = OutputOptions {
@@ -401,7 +516,10 @@ impl StreamingSession {
             modifier_release_timeout: std::time::Duration::from_millis(0),
         };
         let result = deliver_with_fallback(chain, text, opts).await;
-        self.note_delivery(result)?;
+        if let Err(e) = self.note_delivery(result) {
+            self.needs_separator = separator_before;
+            return Err(e);
+        }
 
         self.typed_chars += text.chars().count();
         // Treat the partial-stream-so-far plus this final tail as the
@@ -757,6 +875,182 @@ mod tests {
             session.typed_chars(),
             session.finalized_text().chars().count()
         );
+    }
+
+    #[tokio::test]
+    async fn live_cleanup_handles_split_fillers_without_changing_real_words() {
+        let rec = std::sync::Arc::new(RecordingOutput::new());
+        let chain = chain_with(rec.clone());
+        let mut session = StreamingSession::new();
+        let tp = TextProcessor::new(&crate::config::TextConfig::default());
+        for text in ["I u", "m, need an um", "brella."] {
+            session
+                .type_partial_delta_filtered(&chain, text.into(), &tp, None, None)
+                .await
+                .unwrap();
+        }
+        session
+            .flush_live_filter(&chain, &tp, None, None)
+            .await
+            .unwrap();
+        assert_eq!(rec.typed().concat(), "I need an umbrella.");
+    }
+
+    #[tokio::test]
+    async fn live_cleanup_keeps_one_separator_after_pause_and_filler_only_phrase() {
+        let rec = std::sync::Arc::new(RecordingOutput::new());
+        let chain = chain_with(rec.clone());
+        let mut session = StreamingSession::new();
+        let tp = TextProcessor::new(&crate::config::TextConfig::default());
+        for text in ["Um, hello there.", "uh,", "uh, next phrase."] {
+            session
+                .type_partial_delta_filtered(&chain, text.into(), &tp, None, None)
+                .await
+                .unwrap();
+            session
+                .flush_live_filter(&chain, &tp, None, None)
+                .await
+                .unwrap();
+            session.finish_speech_segment(false);
+        }
+        assert_eq!(rec.typed().concat(), "hello there. next phrase.");
+    }
+
+    #[tokio::test]
+    async fn live_cleanup_optout_is_immediate_and_long_tokens_are_bounded() {
+        let rec = std::sync::Arc::new(RecordingOutput::new());
+        let chain = chain_with(rec.clone());
+        let mut session = StreamingSession::new();
+        let config = crate::config::TextConfig {
+            filter_filler_words: false,
+            ..Default::default()
+        };
+        let tp = TextProcessor::new(&config);
+        session
+            .type_partial_delta_filtered(&chain, "um literal".into(), &tp, None, None)
+            .await
+            .unwrap();
+        assert_eq!(rec.typed().concat(), "um literal");
+        let long = "x".repeat(8192);
+        let tp = TextProcessor::new(&crate::config::TextConfig::default());
+        session
+            .type_partial_delta_filtered(&chain, long.clone(), &tp, None, None)
+            .await
+            .unwrap();
+        assert!(session.live_filter_pending.len() <= 4096);
+        assert!(rec.typed().concat().ends_with(&long));
+    }
+
+    #[tokio::test]
+    async fn live_cleanup_keeps_unsent_words_and_pause_separator_on_output_error() {
+        let rec = std::sync::Arc::new(RecordingOutput::new());
+        let chain = chain_with(rec.clone());
+        let tp = TextProcessor::new(&crate::config::TextConfig::default());
+        let mut session = StreamingSession::new();
+        session
+            .type_partial_delta(&chain, "First.".into(), None, None)
+            .await
+            .unwrap();
+        session.finish_speech_segment(false);
+        assert!(session
+            .type_partial_delta_filtered(&[], "hello world".into(), &tp, None, None)
+            .await
+            .is_err());
+        session
+            .flush_live_filter(&chain, &tp, None, None)
+            .await
+            .unwrap();
+        assert_eq!(rec.typed().concat(), "First. hello world");
+    }
+
+    #[tokio::test]
+    async fn live_cleanup_final_retry_does_not_lose_or_repeat_pending_word() {
+        let rec = std::sync::Arc::new(RecordingOutput::new());
+        let chain = chain_with(rec.clone());
+        let tp = TextProcessor::new(&crate::config::TextConfig::default());
+        let mut session = StreamingSession::new();
+        session
+            .type_partial_delta_filtered(&chain, "hello".into(), &tp, None, None)
+            .await
+            .unwrap();
+        assert!(session
+            .commit_live_delta(&[], " world", &tp, None, None)
+            .await
+            .is_err());
+        session
+            .commit_live_delta(&chain, " world", &tp, None, None)
+            .await
+            .unwrap();
+        assert_eq!(rec.typed().concat(), "hello world");
+    }
+
+    #[tokio::test]
+    async fn live_cleanup_removes_filler_without_space_before_sentence_punctuation() {
+        for chunks in [["I said um.", " Then"], ["I said, um.", " Then"]] {
+            let rec = std::sync::Arc::new(RecordingOutput::new());
+            let chain = chain_with(rec.clone());
+            let mut s = StreamingSession::new();
+            let tp = TextProcessor::new(&crate::config::TextConfig::default());
+            for chunk in chunks {
+                s.type_partial_delta_filtered(&chain, chunk.into(), &tp, None, None)
+                    .await
+                    .unwrap();
+            }
+            s.flush_live_filter(&chain, &tp, None, None).await.unwrap();
+            assert_eq!(rec.typed().concat(), "I said. Then");
+        }
+    }
+
+    #[tokio::test]
+    async fn live_cleanup_flush_is_filler_only_and_keeps_failed_word_across_pause() {
+        let rec = std::sync::Arc::new(RecordingOutput::new());
+        let chain = chain_with(rec.clone());
+        let mut s = StreamingSession::new();
+        let cfg = crate::config::TextConfig {
+            spoken_punctuation: true,
+            ..Default::default()
+        };
+        let tp = TextProcessor::new(&cfg);
+        s.type_partial_delta_filtered(&chain, "period".into(), &tp, None, None)
+            .await
+            .unwrap();
+        assert!(s.flush_live_filter(&[], &tp, None, None).await.is_err());
+        s.finish_speech_segment(false);
+        s.type_partial_delta_filtered(&chain, "next ".into(), &tp, None, None)
+            .await
+            .unwrap();
+        s.flush_live_filter(&chain, &tp, None, None).await.unwrap();
+        assert_eq!(rec.typed().concat(), "period next");
+    }
+
+    #[tokio::test]
+    async fn live_cleanup_large_literal_can_retry_without_loss() {
+        let rec = std::sync::Arc::new(RecordingOutput::new());
+        let chain = chain_with(rec.clone());
+        let mut s = StreamingSession::new();
+        let tp = TextProcessor::new(&crate::config::TextConfig::default());
+        let text = "x".repeat(8192);
+        assert!(s
+            .type_partial_delta_filtered(&[], text.clone(), &tp, None, None)
+            .await
+            .is_err());
+        s.flush_live_filter(&chain, &tp, None, None).await.unwrap();
+        assert_eq!(rec.typed().concat(), text);
+    }
+
+    #[tokio::test]
+    async fn live_cleanup_preserves_literal_namespace_punctuation() {
+        let rec = std::sync::Arc::new(RecordingOutput::new());
+        let chain = chain_with(rec.clone());
+        let mut s = StreamingSession::new();
+        let tp = TextProcessor::new(&crate::config::TextConfig::default());
+        for delta in ["namespace:: ", "method ", ":: ", "value"] {
+            s.type_partial_delta_filtered(&chain, delta.into(), &tp, None, None)
+                .await
+                .unwrap();
+        }
+        s.flush_live_filter(&chain, &tp, None, None).await.unwrap();
+        assert_eq!(rec.typed().concat(), "namespace:: method :: value");
     }
 
     #[tokio::test]

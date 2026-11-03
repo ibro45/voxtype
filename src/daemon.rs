@@ -2642,6 +2642,29 @@ impl Daemon {
         // before the session is dropped below. Mirrors the classic
         // (non-streaming) path's file handling: the output hooks wrap the
         // write and a failed write falls back to the clipboard.
+        if matches!(
+            &*state,
+            State::Streaming {
+                file_output_path: None,
+                ..
+            }
+        ) {
+            if let (Some(session), Some(chain)) =
+                (streaming_session.as_mut(), streaming_chain.as_ref())
+            {
+                if let Err(e) = session
+                    .flush_live_filter(
+                        chain,
+                        &self.text_processor,
+                        self.config.output.pre_output_command.as_deref(),
+                        self.config.output.post_output_command.as_deref(),
+                    )
+                    .await
+                {
+                    tracing::error!("Final word-filter flush failed: {}", e);
+                }
+            }
+        }
         let file_output_path = match &state {
             State::Streaming {
                 file_output_path, ..
@@ -7365,14 +7388,16 @@ impl Daemon {
                                 if file_output {
                                     s.observe_partial_delta(&text);
                                 } else if let Some(chain) = streaming_chain.as_ref() {
-                                    if let Err(e) = s.type_partial_delta(
-                                        chain,
-                                        text,
-                                        self.config.output.pre_output_command.as_deref(),
-                                        self.config.output.post_output_command.as_deref(),
-                                    ).await {
-                                        tracing::warn!("Streaming partial delta type failed: {}", e);
-                                    }
+                                    let result = if self.config.speech_gate.enabled && self.config.engine == crate::config::TranscriptionEngine::Parakeet {
+                                        s.type_partial_delta_filtered(chain,text,&self.text_processor,
+                                            self.config.output.pre_output_command.as_deref(),
+                                            self.config.output.post_output_command.as_deref()).await
+                                    } else {
+                                        s.type_partial_delta(chain,text,
+                                            self.config.output.pre_output_command.as_deref(),
+                                            self.config.output.post_output_command.as_deref()).await
+                                    };
+                                    if let Err(e)=result {tracing::warn!("Streaming partial delta type failed: {}", e); }
                                 }
                                 if let State::Streaming { typed_chars, .. } = &mut state {
                                     *typed_chars = s.typed_chars();
@@ -7388,18 +7413,33 @@ impl Daemon {
                                     // matches spanning segment boundaries.
                                     s.commit_segment_silent(&text);
                                 } else if let Some(chain) = streaming_chain.as_ref() {
-                                    let profile = self.recording_profile();
-                                    let vocabulary = profile
-                                        .as_ref()
-                                        .and_then(|name| self.profile_vocabularies.get(name));
-                                    if let Err(e) = s.commit_segment(
-                                        chain,
-                                        &text,
-                                        Some((&self.text_processor, vocabulary)),
-                                        self.config.output.pre_output_command.as_deref(),
-                                        self.config.output.post_output_command.as_deref(),
-                                    ).await {
-                                        tracing::error!("Streaming commit_segment failed: {}", e);
+                                    let result = if self.config.speech_gate.enabled
+                                        && self.config.engine == crate::config::TranscriptionEngine::Parakeet
+                                    {
+                                        s.commit_live_delta(
+                                            chain,
+                                            &text,
+                                            &self.text_processor,
+                                            self.config.output.pre_output_command.as_deref(),
+                                            self.config.output.post_output_command.as_deref(),
+                                        )
+                                        .await
+                                    } else {
+                                        let profile = self.recording_profile();
+                                        let vocabulary = profile
+                                            .as_ref()
+                                            .and_then(|name| self.profile_vocabularies.get(name));
+                                        s.commit_segment(
+                                            chain,
+                                            &text,
+                                            Some((&self.text_processor, vocabulary)),
+                                            self.config.output.pre_output_command.as_deref(),
+                                            self.config.output.post_output_command.as_deref(),
+                                        )
+                                        .await
+                                    };
+                                    if let Err(e) = result {
+                                        tracing::error!("Streaming final output failed: {}", e);
                                     }
                                 }
                                 // Mirror typed_chars onto the state for cancel-rewind.
@@ -7440,6 +7480,15 @@ impl Daemon {
                         }
                         Some(StreamingEvent::SegmentEnded) => {
                             if let Some(session) = streaming_session.as_mut() {
+                                if !file_output {
+                                    if let Some(chain)=streaming_chain.as_ref() {
+                                        if let Err(e)=session.flush_live_filter(chain,&self.text_processor,
+                                            self.config.output.pre_output_command.as_deref(),
+                                            self.config.output.post_output_command.as_deref()).await {
+                                            tracing::error!("Streaming word-filter flush failed: {}",e);
+                                        }
+                                    }
+                                }
                                 session.finish_speech_segment(file_output);
                                 if let State::Streaming { typed_chars, .. } = &mut state { *typed_chars=session.typed_chars(); }
                             }

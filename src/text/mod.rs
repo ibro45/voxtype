@@ -379,6 +379,50 @@ impl TextProcessor {
         result
     }
 
+    /// Whether a stable-word live stream needs a filler lookahead buffer.
+    pub fn filters_streaming_fillers(&self) -> bool {
+        self.filler_re.is_some()
+    }
+
+    /// Conservative filler removal on complete live words. Preserve the
+    /// leading separator and meaningful trailing punctuation; do not run
+    /// phrase replacements or rewrite already emitted text.
+    pub fn clean_streaming_fillers(&self, text: &str) -> String {
+        let Some(re) = &self.filler_re else {
+            return text.to_owned();
+        };
+        let punctuation_only = text
+            .chars()
+            .all(|c| c.is_whitespace() || matches!(c, ',' | ';' | ':' | '.' | '!' | '?'));
+        let sentence_punctuation =
+            punctuation_only && text.contains(['.', '!', '?']) && !text.contains("::");
+        if !re.is_match(text) && !sentence_punctuation {
+            return text.to_owned();
+        }
+        let leading = &text[..text.len() - text.trim_start().len()];
+        let result = re.replace_all(text, " ");
+        let result = self.filler_punct_re.replace_all(&result, "$1");
+        let result = self.filler_dup_punct_re.replace_all(&result, "$1");
+        let result = self
+            .filler_connector_before_term_re
+            .replace_all(&result, "$2");
+        let result = self.filler_space_re.replace_all(&result, " ");
+        let cleaned = result
+            .trim()
+            .trim_start_matches([',', ';', ':'])
+            .trim_start();
+        if cleaned
+            .chars()
+            .all(|c| c.is_whitespace() || matches!(c, ',' | ';' | ':'))
+        {
+            String::new()
+        } else if cleaned.starts_with(['.', '!', '?']) {
+            cleaned.to_owned()
+        } else {
+            format!("{leading}{cleaned}")
+        }
+    }
+
     /// Check if text ends with the submit trigger word.
     ///
     /// Returns `(stripped_text, should_submit)`. Handles trailing punctuation (e.g.,
