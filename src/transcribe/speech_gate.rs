@@ -22,6 +22,10 @@ struct Segmenter {
     sent: usize,
     silence_samples: usize,
     max_samples: usize,
+    /// Past this age a segment ends at the first quiet hop instead of waiting
+    /// for the full silence hangover, so fluent speech without a long pause
+    /// rarely reaches the hard cut at `max_samples`, which can split a word.
+    soft_samples: usize,
 }
 
 impl Segmenter {
@@ -33,6 +37,7 @@ impl Segmenter {
             sent: 0,
             silence_samples,
             max_samples,
+            soft_samples: max_samples / 3 * 2,
         }
     }
 
@@ -56,7 +61,10 @@ impl Segmenter {
             self.quiet = if speech { 0 } else { self.quiet + audio.len() };
             actions.push(Action::Audio(audio));
         }
-        if self.quiet >= self.silence_samples || self.sent >= self.max_samples {
+        // `quiet > 0` means the latest hop's 512 ms window held no sustained
+        // speech: a real pause, not a gap inside a word.
+        let aged_pause = self.sent >= self.soft_samples && self.quiet > 0;
+        if self.quiet >= self.silence_samples || aged_pause || self.sent >= self.max_samples {
             self.active = false;
             self.preroll.clear();
             actions.push(Action::End);
@@ -789,6 +797,31 @@ mod tests {
         assert!(
             matches!(&gate.push(vec![5.0;HOP],true)[..], [Action::Start(x)] if x.len()==HOP && x[0]==5.0)
         );
+    }
+
+    #[test]
+    fn aged_segment_ends_at_the_first_quiet_hop_before_the_hard_cut() {
+        // 30-hop cap, so the soft point is 20 hops; the hangover is 5 hops.
+        let mut gate = Segmenter::new(5 * HOP, 30 * HOP);
+        let mut events = Vec::new();
+        for _ in 0..10 {
+            events.extend(gate.push(vec![1.0; HOP], true));
+        }
+        // A one-hop pause early in the segment does not end it.
+        assert!(matches!(
+            &gate.push(vec![0.0; HOP], false)[..],
+            [Action::Audio(_)]
+        ));
+        for _ in 0..12 {
+            events.extend(gate.push(vec![1.0; HOP], true));
+        }
+        assert!(!events.iter().any(|a| matches!(a, Action::End)));
+        // Past 20 hops, the same short pause ends the segment.
+        assert!(matches!(
+            &gate.push(vec![0.0; HOP], false)[..],
+            [Action::Audio(_), Action::End]
+        ));
+        assert!(!gate.active);
     }
 
     #[test]

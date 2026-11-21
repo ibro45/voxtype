@@ -1415,7 +1415,7 @@ pub const CONFIG_KEYS: &[KeySpec] = &[
     spec("speech_gate.model", "speech_gate", "model", KeyType::String, "VAD", "Silero GGML model path", "Optional bounded speech segmentation; disabled by default."),
     spec("speech_gate.threshold", "speech_gate", "threshold", KeyType::Float { min: 0.0, max: 1.0 }, "VAD", "Speech gate confidence", "Optional bounded speech segmentation; disabled by default."),
     spec("speech_gate.silence_ms", "speech_gate", "silence_ms", KeyType::Int { min: 128, max: 3000 }, "VAD", "Quiet hangover before finalizing speech", "Optional bounded speech segmentation; disabled by default."),
-    spec("speech_gate.max_speech_secs", "speech_gate", "max_speech_secs", KeyType::Int { min: 5, max: 60 }, "VAD", "Maximum inner speech segment seconds", "Optional bounded speech segmentation; disabled by default."),
+    spec("speech_gate.max_speech_secs", "speech_gate", "max_speech_secs", KeyType::Int { min: 5, max: 60 }, "VAD", "Maximum inner speech segment seconds", "Longest speech segment. Past two-thirds of it a segment ends at the first short pause; the full length is a hard cut."),
     // -- Meeting ------------------------------------------------------------
     spec(
         "meeting.enabled",
