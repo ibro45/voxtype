@@ -67,7 +67,7 @@ impl ParakeetTranscriber {
         let start = std::time::Instant::now();
 
         // Configure execution provider based on feature flags
-        let exec_config = build_execution_config(config.threads);
+        let exec_config = build_execution_config(config.threads, config.allow_spinning);
 
         let model = match model_type {
             ParakeetModelType::Ctc => {
@@ -265,14 +265,29 @@ pub(crate) fn lines_from_tokens(tokens: &[TimedToken]) -> Vec<TimedSegment> {
 }
 
 /// Build the ONNX Runtime session config: the execution provider the
-/// features select, with `threads` intra-op threads when it is set. Unset
-/// keeps parakeet-rs's default of 4.
-pub(super) fn build_execution_config(threads: Option<usize>) -> Option<ExecutionConfig> {
-    let config = provider_execution_config();
-    match threads {
-        Some(n) => Some(config.unwrap_or_default().with_intra_threads(n)),
-        None => config,
+/// features select, with `threads` intra-op threads when it is set (unset
+/// keeps parakeet-rs's default of 4) and the worker spin policy when
+/// `allow_spinning` is set (unset keeps ONNX Runtime's).
+pub(super) fn build_execution_config(
+    threads: Option<usize>,
+    allow_spinning: Option<bool>,
+) -> Option<ExecutionConfig> {
+    let mut config = provider_execution_config();
+    if let Some(n) = threads {
+        config = Some(config.unwrap_or_default().with_intra_threads(n));
     }
+    if let Some(spin) = allow_spinning {
+        config = Some(
+            config
+                .unwrap_or_default()
+                .with_custom_configure(move |builder| {
+                    Ok(builder
+                        .with_intra_op_spinning(spin)?
+                        .with_inter_op_spinning(spin)?)
+                }),
+        );
+    }
+    config
 }
 
 /// Execution provider config based on compile-time feature flags
@@ -581,8 +596,22 @@ mod tests {
 
     #[test]
     fn threads_set_the_onnx_intra_op_thread_count() {
-        let config = build_execution_config(Some(12)).expect("threads set");
+        let config = build_execution_config(Some(12), None).expect("threads set");
         assert_eq!(config.intra_threads, 12);
+        assert!(config.configure.is_none());
+    }
+
+    #[test]
+    fn allow_spinning_sets_a_native_configure_hook() {
+        let spin_only = build_execution_config(None, Some(false)).expect("spinning set");
+        assert_eq!(
+            spin_only.intra_threads,
+            ExecutionConfig::default().intra_threads
+        );
+        assert!(spin_only.configure.is_some());
+        let both = build_execution_config(Some(2), Some(false)).expect("both set");
+        assert_eq!(both.intra_threads, 2);
+        assert!(both.configure.is_some());
     }
 
     #[cfg(not(any(
@@ -592,7 +621,7 @@ mod tests {
     )))]
     #[test]
     fn unset_threads_keep_the_parakeet_rs_default_on_the_cpu() {
-        assert!(build_execution_config(None).is_none());
+        assert!(build_execution_config(None, None).is_none());
     }
     use tempfile::TempDir;
 

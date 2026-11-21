@@ -483,6 +483,16 @@ pub const CONFIG_KEYS: &[KeySpec] = &[
     )
     .for_onnx_engine("parakeet"),
     spec(
+        "parakeet.allow_spinning",
+        "parakeet",
+        "allow_spinning",
+        KeyType::Bool,
+        "Advanced",
+        "ONNX worker spinning",
+        "Let ONNX Runtime workers spin-wait for work. False favors lower CPU use; unset keeps the native behavior.",
+    )
+    .for_onnx_engine("parakeet"),
+    spec(
         "parakeet.gguf_backend",
         "parakeet",
         "gguf_backend",
@@ -3248,6 +3258,10 @@ pub fn resolve(key: &str, cfg: &Config) -> Option<Json> {
         },
         "parakeet.threads" => match pk().threads {
             Some(n) => json!(n),
+            None => Json::Null,
+        },
+        "parakeet.allow_spinning" => match pk().allow_spinning {
+            Some(b) => json!(b),
             None => Json::Null,
         },
         "parakeet.gguf_backend" => json!(pk().gguf_backend),

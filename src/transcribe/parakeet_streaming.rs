@@ -98,7 +98,7 @@ impl ParakeetStreamingTranscriber {
         );
         let start = std::time::Instant::now();
 
-        let exec_config = build_execution_config(config.threads);
+        let exec_config = build_execution_config(config.threads, config.allow_spinning);
         let handle = ParakeetUnifiedHandle::load(&model_path, exec_config).map_err(|e| {
             TranscribeError::InitFailed(format!(
                 "Parakeet streaming (ParakeetUnified) init failed: {}\n\n\

@@ -41,6 +41,12 @@ pub struct ParakeetConfig {
     #[serde(default)]
     pub threads: Option<usize>,
 
+    /// Let ONNX Runtime workers spin-wait for work (ONNX models only).
+    /// Unset keeps the native behaviour; false lets them sleep, trading a
+    /// little latency for lower CPU use.
+    #[serde(default)]
+    pub allow_spinning: Option<bool>,
+
     /// Load model on-demand when recording starts (true) or keep loaded (false)
     #[serde(default = "default_on_demand_loading")]
     pub on_demand_loading: bool,
@@ -127,6 +133,7 @@ impl Default for ParakeetConfig {
             gguf_backend: default_gguf_backend(),
             model_type: None, // Auto-detect
             threads: None,
+            allow_spinning: None,
             on_demand_loading: false,
             max_window_secs: default_parakeet_max_window_secs(),
             window_overlap_secs: default_parakeet_window_overlap_secs(),

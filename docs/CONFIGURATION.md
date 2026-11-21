@@ -1574,6 +1574,21 @@ With a GGUF model, this is transcribe.cpp's CPU thread count instead, and unset 
 threads = 12
 ```
 
+### allow_spinning
+
+**Type:** Boolean (optional)
+**Default:** unset (ONNX Runtime's native behavior)
+**Required:** No
+
+Whether ONNX Runtime worker threads spin-wait for work between items. `false` lets them sleep instead, which lowers CPU use at a small latency cost; `true` allows spinning explicitly. Applies to ONNX models only, and sets inter-op spinning too for consistency.
+
+**Example:**
+```toml
+[parakeet]
+threads = 2
+allow_spinning = false
+```
+
 ### gguf_backend
 
 **Type:** String
