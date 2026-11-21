@@ -50,44 +50,48 @@ impl WtypeOutput {
         }
     }
 
+    /// wtype arguments for typing text. The text itself is read from stdin
+    /// (`-`), never passed as an argument: arguments are visible in
+    /// /proc/<pid>/cmdline to every process of the same user, and dictated
+    /// text is private.
+    fn type_args(&self) -> Vec<String> {
+        let mut args = Vec::new();
+        // Pre-typing delay helps prevent first character drop
+        if self.pre_type_delay_ms > 0 {
+            args.extend(["-s".to_string(), self.pre_type_delay_ms.to_string()]);
+        }
+        if self.type_delay_ms > 0 {
+            args.extend(["-d".to_string(), self.type_delay_ms.to_string()]);
+        }
+        // Shift prefix prevents the first CJK character drop in some apps
+        if self.shift_prefix {
+            args.extend(["-P", "Shift_L", "-p", "Shift_L"].map(String::from));
+        }
+        args.push("-".to_string());
+        args
+    }
+
     /// Type a string of text using wtype
     async fn type_text(&self, text: &str) -> Result<(), OutputError> {
+        use tokio::io::AsyncWriteExt;
+
         if text.is_empty() {
             return Ok(());
         }
 
-        let mut cmd = Command::new("wtype");
-        let mut debug_args = vec!["wtype".to_string()];
+        let args = self.type_args();
+        tracing::debug!(
+            chars = text.chars().count(),
+            "Running: wtype {}",
+            args.join(" ")
+        );
 
-        // Add pre-typing delay if configured (helps prevent first character drop)
-        if self.pre_type_delay_ms > 0 {
-            cmd.arg("-s").arg(self.pre_type_delay_ms.to_string());
-            debug_args.push(format!("-s {}", self.pre_type_delay_ms));
-        }
-
-        // Add inter-keystroke delay if configured
-        if self.type_delay_ms > 0 {
-            cmd.arg("-d").arg(self.type_delay_ms.to_string());
-            debug_args.push(format!("-d {}", self.type_delay_ms));
-        }
-
-        // Add Shift prefix to prevent first CJK character drop in some apps
-        if self.shift_prefix {
-            cmd.arg("-P").arg("Shift_L").arg("-p").arg("Shift_L");
-            debug_args.push("-P Shift_L -p Shift_L".to_string());
-        }
-
-        debug_args.push("--".to_string());
-        debug_args.push(format!("\"{}\"", text.chars().take(20).collect::<String>()));
-        tracing::debug!("Running: {}", debug_args.join(" "));
-
-        let output = cmd
-            .arg("--")
-            .arg(text)
+        let mut child = Command::new("wtype")
+            .args(&args)
+            .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
-            .output()
-            .await
+            .spawn()
             .map_err(|e| {
                 if e.kind() == std::io::ErrorKind::NotFound {
                     OutputError::WtypeNotFound
@@ -95,6 +99,24 @@ impl WtypeOutput {
                     OutputError::InjectionFailed(e.to_string())
                 }
             })?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            let written = stdin.write_all(text.as_bytes()).await;
+            // Closing stdin tells wtype the text is complete.
+            drop(stdin);
+            if let Err(e) = written {
+                let _ = child.kill().await;
+                return Err(OutputError::InjectionFailed(format!(
+                    "wtype stdin write failed: {}",
+                    e
+                )));
+            }
+        }
+
+        let output = child
+            .wait_with_output()
+            .await
+            .map_err(|e| OutputError::InjectionFailed(e.to_string()))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -214,6 +236,17 @@ impl TextOutput for WtypeOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_is_never_an_argument() {
+        let output = WtypeOutput::new(false, None, 1, 200, false, true);
+        assert_eq!(
+            output.type_args(),
+            ["-s", "200", "-d", "1", "-P", "Shift_L", "-p", "Shift_L", "-"]
+        );
+        let plain = WtypeOutput::new(false, None, 0, 0, false, false);
+        assert_eq!(plain.type_args(), ["-"]);
+    }
 
     #[test]
     fn test_new() {
