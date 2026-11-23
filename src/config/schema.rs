@@ -1097,10 +1097,10 @@ pub const CONFIG_KEYS: &[KeySpec] = &[
         "audio.max_duration_secs",
         "audio",
         "max_duration_secs",
-        KeyType::Int { min: 5, max: 3600 },
+        KeyType::Int { min: 0, max: 3600 },
         "Audio",
         "Max recording length",
-        "Safety cap in seconds; recording stops on its own at this point.",
+        "Shared activation cap in seconds for hold and toggle; 0 disables the cap.",
     ),
     spec(
         "audio.keep_failed_recordings",
@@ -1416,7 +1416,6 @@ pub const CONFIG_KEYS: &[KeySpec] = &[
     spec("speech_gate.threshold", "speech_gate", "threshold", KeyType::Float { min: 0.0, max: 1.0 }, "VAD", "Speech gate confidence", "Optional bounded speech segmentation; disabled by default."),
     spec("speech_gate.silence_ms", "speech_gate", "silence_ms", KeyType::Int { min: 128, max: 3000 }, "VAD", "Quiet hangover before finalizing speech", "Optional bounded speech segmentation; disabled by default."),
     spec("speech_gate.max_speech_secs", "speech_gate", "max_speech_secs", KeyType::Int { min: 5, max: 60 }, "VAD", "Maximum inner speech segment seconds", "Optional bounded speech segmentation; disabled by default."),
-    spec("speech_gate.continuous_toggle", "speech_gate", "continuous_toggle", KeyType::Bool, "VAD", "Remove outer duration cap for gated live toggle only", "Optional bounded speech segmentation; disabled by default."),
     // -- Meeting ------------------------------------------------------------
     spec(
         "meeting.enabled",
@@ -3416,7 +3415,6 @@ pub fn resolve(key: &str, cfg: &Config) -> Option<Json> {
         "speech_gate.threshold" => f32_json(cfg.speech_gate.threshold),
         "speech_gate.silence_ms" => json!(cfg.speech_gate.silence_ms),
         "speech_gate.max_speech_secs" => json!(cfg.speech_gate.max_speech_secs),
-        "speech_gate.continuous_toggle" => json!(cfg.speech_gate.continuous_toggle),
 
         "vad.enabled" => json!(cfg.vad.enabled),
         "vad.backend" => serde_json::to_value(cfg.vad.backend).ok()?,
@@ -4150,7 +4148,7 @@ mod tests {
             .find(|s| s.key == "audio.max_duration_secs")
             .unwrap();
         assert!(matches!(
-            validate_value(dur, "0"),
+            validate_value(dur, "-1"),
             Err(ValueError::OutOfRange { .. })
         ));
         assert!(matches!(

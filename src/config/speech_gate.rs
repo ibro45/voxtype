@@ -9,7 +9,6 @@ pub struct SpeechGateConfig {
     pub threshold: f32,
     pub silence_ms: u64,
     pub max_speech_secs: u64,
-    pub continuous_toggle: bool,
 }
 
 impl Default for SpeechGateConfig {
@@ -20,7 +19,6 @@ impl Default for SpeechGateConfig {
             threshold: 0.5,
             silence_ms: 640,
             max_speech_secs: 30,
-            continuous_toggle: false,
         }
     }
 }

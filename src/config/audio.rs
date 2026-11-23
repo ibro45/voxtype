@@ -13,7 +13,7 @@ pub struct AudioConfig {
     #[serde(default = "default_audio_sample_rate")]
     pub sample_rate: u32,
 
-    /// Maximum recording duration in seconds (safety limit)
+    /// Maximum activation duration in seconds for all recording modes; 0 disables the cap.
     #[serde(default = "default_audio_max_duration_secs")]
     pub max_duration_secs: u32,
 
@@ -92,6 +92,17 @@ pub struct AudioConfig {
     /// the same command a second wake word would send).
     #[serde(default)]
     pub external_trigger_stop_command: Option<String>,
+}
+
+impl AudioConfig {
+    /// One shared activation limit; independent of trigger source/output mode.
+    /// Inner speech-segment bounds and capture watchdogs remain separate.
+    pub fn recording_timeout_reached(&self, elapsed: Option<std::time::Duration>) -> bool {
+        self.max_duration_secs > 0
+            && elapsed.is_some_and(|duration| {
+                duration > std::time::Duration::from_secs(self.max_duration_secs as u64)
+            })
+    }
 }
 
 impl Default for AudioConfig {
@@ -180,5 +191,58 @@ impl Default for AudioFeedbackConfig {
             theme: default_sound_theme(),
             volume: default_volume(),
         }
+    }
+}
+
+#[cfg(test)]
+mod recording_limit_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn zero_recording_limit_keeps_hold_and_live_states_running() {
+        let config = AudioConfig {
+            max_duration_secs: 0,
+            ..Default::default()
+        };
+        let began = std::time::Instant::now() - Duration::from_secs(601);
+        let states = [
+            crate::state::State::Recording {
+                started_at: began,
+                model_override: None,
+            },
+            crate::state::State::Streaming {
+                started_at: began,
+                model_override: None,
+                partial_buffer: String::new(),
+                finalized_text: String::new(),
+                typed_chars: 0,
+                file_output_path: None,
+            },
+            crate::state::State::Streaming {
+                started_at: began,
+                model_override: None,
+                partial_buffer: String::new(),
+                finalized_text: String::new(),
+                typed_chars: 0,
+                file_output_path: Some("hold.txt".into()),
+            },
+        ];
+        for state in states {
+            assert!(!config.recording_timeout_reached(state.recording_duration()));
+        }
+        assert!(!config.recording_timeout_reached(Some(Duration::from_secs(86400))));
+        assert!(!config.recording_timeout_reached(None));
+    }
+
+    #[test]
+    fn positive_recording_limit_still_expires() {
+        let config = AudioConfig {
+            max_duration_secs: 600,
+            ..Default::default()
+        };
+        assert!(!config.recording_timeout_reached(Some(Duration::from_secs(599))));
+        assert!(config.recording_timeout_reached(Some(Duration::from_secs(601))));
+        assert!(!config.recording_timeout_reached(None));
     }
 }

@@ -566,14 +566,15 @@ sample_rate = 16000
 **Default:** `60`
 **Required:** No
 
-Maximum recording duration in seconds. Recording automatically stops after this limit as a safety measure. When the limit is reached, the captured audio is transcribed and output normally rather than being discarded, and a "Recording Limit Reached" notification says so. A "Recording Limit Approaching" notification comes first, 30 seconds before the limit (10 seconds for limits under two minutes, none under 30 seconds).
+Maximum activation duration in seconds. One shared cap applies equally to push-to-talk hold, toggle, and external triggers (`voxtype record start`/`toggle`). When the limit is reached, the captured audio is transcribed and output normally rather than being discarded, and a "Recording Limit Reached" notification says so. A "Recording Limit Approaching" notification comes first, 30 seconds before the limit (10 seconds for limits under two minutes, none under 30 seconds). `0` disables the cap, so recording runs until you stop it.
 
-Raise it for long dictations. A recording uses about 3.8 MB of memory per minute while it is captured. Parakeet transcribes recordings longer than [`[parakeet] max_window_secs`](#max_window_secs) in windows, so long recordings do not hit the model's length limit.
+Raise it for long dictations. A recording uses about 3.8 MB of memory per minute while it is captured. Parakeet transcribes recordings longer than [`[parakeet] max_window_secs`](#max_window_secs) in windows, so long recordings do not hit the model's length limit. With `0`, memory stays bounded only when `[speech_gate]` is enabled (inner speech segments are capped by `max_speech_secs`); an ungated batch backend keeps the whole recording in memory and decodes it at once.
 
 **Example:**
 ```toml
 [audio]
 max_duration_secs = 120  # Allow 2-minute recordings
+# max_duration_secs = 0  # No cap (use with [speech_gate] enabled)
 ```
 
 ### keep_failed_recordings
@@ -5872,3 +5873,9 @@ incompatible hints fail without modifying the file. Model paths are preserved
 literally and resolved like the worker: an existing current-directory path wins,
 otherwise the models directory is searched. Existing `config set` contracts are
 unchanged.
+
+### Shared activation duration
+
+`[audio] max_duration_secs = 0` disables the outer activation timeout for all recording modes and trigger sources. Positive values retain a shared hard cap. The default is unchanged. The optional gated overlay no longer uses a separate `speech_gate.continuous_toggle` setting; remove that legacy key from existing configs.
+
+Speech-gate segment sizes and capture watchdogs are independent and remain enabled. Gated hold buffers recognized text until release, so text memory grows with that activation; it does not retain the whole audio recording. Unlimited duration alone does not bound audio in an ungated batch backend.

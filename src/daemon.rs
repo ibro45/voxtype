@@ -6570,7 +6570,7 @@ impl Daemon {
         // Audio capture (created fresh for each recording)
         let mut audio_capture: Option<Box<dyn AudioCapture>> = None;
 
-        // Recording timeout
+        // Recording timeout (0 = no cap; see AudioConfig::recording_timeout_reached)
         let max_duration = Duration::from_secs(self.config.audio.max_duration_secs as u64);
 
         let activation_mode = self.config.hotkey.mode;
@@ -7127,13 +7127,8 @@ impl Daemon {
                     // already gone so we don't re-fire cleanup on every 100ms
                     // tick while the streaming session drains server-side
                     // (state stays Streaming until Ended arrives).
-                    let unlimited_toggle = self.config.speech_gate.enabled
-                        && self.config.speech_gate.continuous_toggle
-                        && !self.is_external_trigger
-                        && matches!(self.config.hotkey.mode, crate::config::ActivationMode::Toggle)
-                        && matches!(&state, State::Streaming { file_output_path: None, .. });
                     if let (true, Some(elapsed)) =
-                        (audio_capture.is_some() && !unlimited_toggle, state.recording_duration())
+                        (audio_capture.is_some(), state.recording_duration())
                     {
                         match cap_warning_due(elapsed, max_duration) {
                             Some(left) if !cap_warned => {
@@ -7145,8 +7140,8 @@ impl Daemon {
                         }
                     }
 
-                    let timeout_fired = audio_capture.is_some() && !unlimited_toggle
-                        && state.recording_duration().is_some_and(|d| d > max_duration);
+                    let timeout_fired = audio_capture.is_some()
+                        && self.config.audio.recording_timeout_reached(state.recording_duration());
                     if timeout_fired {
                         self.osd_limit_reached = true;
                         // A hard-capped session is ending on voxtype's own
@@ -7162,7 +7157,7 @@ impl Daemon {
                         if state.is_streaming() {
                             tracing::warn!(
                                 "Recording timeout ({:.0}s limit) while streaming; closing capture",
-                                max_duration.as_secs_f32()
+                                self.config.audio.max_duration_secs as f32
                             );
                             self.stop_streaming_capture(&mut audio_capture).await;
                             self.notify_recording_capped(max_duration).await;
@@ -7171,7 +7166,7 @@ impl Daemon {
 
                         tracing::warn!(
                             "Recording timeout ({:.0}s limit), transcribing captured audio",
-                            max_duration.as_secs_f32()
+                            self.config.audio.max_duration_secs as f32
                         );
 
 

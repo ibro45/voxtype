@@ -280,7 +280,7 @@ pub struct Cli {
     #[arg(long, value_name = "DEVICE", help_heading = "Audio")]
     pub audio_device: Option<String>,
 
-    /// Maximum recording duration in seconds (safety limit)
+    /// Maximum recording duration in seconds for all modes; 0 disables the cap
     #[arg(
         long,
         value_name = "SECS",
