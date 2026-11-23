@@ -30,7 +30,9 @@ impl VoxtypeState {
     fn from_str(s: &str) -> Self {
         match s.trim().to_lowercase().as_str() {
             "idle" => VoxtypeState::Idle,
-            "recording" => VoxtypeState::Recording,
+            // Live dictation reports "streaming". Without it the icon showed
+            // "Daemon not running" for the whole session.
+            "recording" | "streaming" => VoxtypeState::Recording,
             "transcribing" => VoxtypeState::Transcribing,
             _ => VoxtypeState::Stopped,
         }
@@ -695,4 +697,20 @@ pub fn run(state_file: PathBuf) -> ! {
             *control_flow = ControlFlow::Exit;
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_dictation_shows_as_recording() {
+        assert_eq!(
+            VoxtypeState::from_str("streaming\n"),
+            VoxtypeState::Recording
+        );
+        assert_eq!(VoxtypeState::from_str("recording"), VoxtypeState::Recording);
+        assert_eq!(VoxtypeState::from_str("idle"), VoxtypeState::Idle);
+        assert_eq!(VoxtypeState::from_str("gone"), VoxtypeState::Stopped);
+    }
 }
