@@ -14,13 +14,6 @@ permissions:
   contents: read
 
 jobs:
-  test:
-    runs-on: macos-15
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test --lib --features parakeet --locked
-
   build:
     runs-on: macos-15
     env:
@@ -28,6 +21,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --lib --features parakeet --locked
       - run: cargo build --release --bin voxtype --features parakeet --locked
       - name: Package
         run: |
@@ -49,7 +43,7 @@ jobs:
 
   publish:
     if: startsWith(github.ref, 'refs/tags/setup-')
-    needs: [test, build]
+    needs: [build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
