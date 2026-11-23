@@ -14,50 +14,54 @@ permissions:
   contents: read
 
 jobs:
-  macos-arm64:
+  test:
     runs-on: macos-15
-    permissions:
-      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --lib --features parakeet --locked
+
+  build:
+    runs-on: macos-15
     env:
       MACOSX_DEPLOYMENT_TARGET: "13.0"
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Test
-        run: cargo test --lib --features parakeet --locked
-
-      - name: Build
-        run: cargo build --release --bin voxtype --features parakeet --locked
-
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --bin voxtype --features parakeet --locked
       - name: Package
         run: |
           set -euo pipefail
           mkdir -p dist
           cp target/release/voxtype dist/voxtype
-          # Re-sign ad hoc so the signature matches the stripped binary.
           codesign --force --sign - dist/voxtype
           codesign --verify --verbose dist/voxtype
           otool -L dist/voxtype
           dist/voxtype --version
-          dist/voxtype info variants 2>/dev/null || true
           git rev-parse HEAD > dist/COMMIT
           tar -C dist -czf voxtype-macos-arm64.tar.gz voxtype COMMIT
           shasum -a 256 voxtype-macos-arm64.tar.gz | tee voxtype-macos-arm64.tar.gz.sha256
-
       - uses: actions/upload-artifact@v4
         with:
           name: voxtype-macos-arm64
           path: voxtype-macos-arm64.tar.gz*
           if-no-files-found: error
 
-      - name: Publish release
-        if: startsWith(github.ref, 'refs/tags/setup-')
-        env:
+  publish:
+    if: startsWith(github.ref, 'refs/tags/setup-')
+    needs: [test, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: voxtype-macos-arm64
+      - env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" --prerelease --title "$GITHUB_REF_NAME" \
-            --notes "Patched Voxtype for Apple Silicon, built from $GITHUB_SHA. Ad-hoc signed, not notarized. Install it with https://github.com/ibro45/voxtype-setup." \
+          sha256sum -c voxtype-macos-arm64.tar.gz.sha256
+          gh release create "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" --verify-tag --prerelease \
+            --title "$GITHUB_REF_NAME" \
+            --notes "Patched Voxtype for Apple Silicon, built from $GITHUB_SHA. Ad-hoc signed, not notarized." \
             voxtype-macos-arm64.tar.gz voxtype-macos-arm64.tar.gz.sha256
